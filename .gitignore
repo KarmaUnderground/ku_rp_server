@@ -1,0 +1,14 @@
+/cache/
+venv
+__pycache__
+venv
+.idea
+
+server/*
+
+db/*
+!db/.keep
+
+starter/*
+!starter/start.py
+!starter/requirements.txt
