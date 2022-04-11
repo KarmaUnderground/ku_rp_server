@@ -45,10 +45,61 @@ def get_script_fragments(path):
             break
 
     return {
-        'name': name,
         'module': module,
-        "groups": groups
+        'name': name,
+        "groups": groups,
+        "path": path
     }
+
+
+def get_sql_scripts():
+    enabled_modules_scripts = {key: [] for key in get_enabled_modules()}
+
+    path_list = Path("./server-data/resources").glob('**/*.sql')
+    for path in path_list:
+        script_fragments = get_script_fragments(str(path))
+
+        for fragment in script_fragments['groups']:
+            if fragment in enabled_modules_scripts:
+                script_fragments['queries'] = split_sql_script_queries(script_fragments['path'])
+                enabled_modules_scripts[fragment].append(script_fragments)
+                break
+
+        if script_fragments['module'] in enabled_modules_scripts:
+            script_fragments['queries'] = split_sql_script_queries(script_fragments['path'])
+            enabled_modules_scripts[script_fragments['module']].append(script_fragments)
+
+    return {k: v for k, v in enabled_modules_scripts.items() if v}
+
+
+def split_sql_script_queries(path):
+    queries = {
+        'create': [],
+        'alter': [],
+        'insert': []
+    }
+
+    script_content = ""
+    fd = open(path, encoding="utf8")
+    for line in fd.readlines():
+        if not re.search("--.*$", line.strip()):
+            script_content = script_content + line.replace("\n", " ").replace("\t", " ")
+    fd.close()
+
+    for query in script_content.split(';'):
+        if query.strip() != '' and \
+           "use " not in query.lower() and\
+           "create database " not in query.lower() and\
+           "alter database " not in query.lower():
+
+            if "create table " in query.lower():
+                queries['create'].append(query)
+            elif "alter table " in query.lower():
+                queries['alter'].append(query)
+            else:
+                queries['insert'].append(query)
+
+    return queries
 
 
 def get_db_connection_variables(config_file):
@@ -65,151 +116,95 @@ def get_db_connection_variables(config_file):
     }
 
 
-def get_db(connection_variables):
-    db_connection = mysql.connector.connect(
-        host=connection_variables['host'],
-        user=connection_variables['user'],
-        password=connection_variables['password'],
-        database=connection_variables['database']
-    )
-    db_cursor = db_connection.cursor()
+def get_db():
+    connection_variables = get_db_connection_variables("./server.cfg")
 
-    return db_connection, db_cursor
-
-
-def execute_sql_scripts():
     db_connection = None
-
-    enabled_modules = get_enabled_modules()
+    db_cursor = None
 
     print("Waiting for database")
     while not db_connection:
         try:
-            db_configs = get_db_connection_variables("./server.cfg")
-            db_connection, db_cursor = get_db(db_configs)
+            db_connection = mysql.connector.connect(
+                host=connection_variables['host'],
+                user=connection_variables['user'],
+                password=connection_variables['password'],
+                database=connection_variables['database']
+            )
+            db_cursor = db_connection.cursor()
         except Exception as e:
             time.sleep(1)
     print("Database started")
 
+    return db_connection, db_cursor, connection_variables
+
+
+def execute_sql_queries(queries, db_cursor):
+        sql_error_query_logs = ""
+
+        for query in queries:
+            try:
+                db_cursor.execute(query)
+            except Exception as e:
+                if e.errno in [1050, 1060, 1062, 1136]:
+                    print("\033[1;33mWARNING:\033[0;37m \"{0}\" when executing \"{1}...\"".format(e.msg, query[0:30]))
+
+                    if e.errno != 1050:
+                        sql_error_query_logs += "\n{0}\n{1}\n".format(e.msg, query.strip())
+                else:
+                    print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\"".format(e.msg, query[0:30]))
+                    print("\033[1;31m\nWe rollback and stop the execution. Make sure you have all the resources dependencies.\033[0;37m")
+
+                    raise e
+
+        return sql_error_query_logs
+
+
+def execute_sql_scripts():
+    db_connection, db_cursor, db_configs = get_db()
+
+    db_cursor.execute("CREATE DATABASE IF NOT EXISTS `{0}`;".format(db_configs['database']))
+
+    db_cursor.execute("USE {0}; ".format(db_configs['database']))
     db_cursor.execute("CREATE TABLE IF NOT EXISTS `ku_sql_files` (`sql_file` varchar(255) COLLATE utf8mb4_bin NOT NULL, PRIMARY KEY (`sql_file`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;")
 
     db_cursor.execute("SELECT * FROM `ku_sql_files`;")
-    results = db_cursor.fetchall()
-    existing_files = []
-    for result in results:
-        existing_files.append(result[0])
+    existing_files = [files[0] for files in db_cursor.fetchall()]
 
-    sql_scripts_paths = []
+    create_queries = []
+    alter_queries = []
+    insert_queries = []
 
-    path_list = Path("./server-data/resources").glob('**/*.sql')
-    for path in path_list:
-        sql_scripts_paths.append(str(path))
+    for key, scripts in get_sql_scripts().items():
+        for script in scripts:
+            if script['path'] in existing_files:
+                continue
 
-    use_db_command = "USE {0}; ".format(db_configs['database'])
-    create_command_list = {}
-    alter_command_list = {}
-    other_command_list = {}
-
-    for path in sql_scripts_paths:
-        script_fragments = get_script_fragments(path)
-
-        in_group = False
-        for fragment in script_fragments['groups']:
-            if fragment in enabled_modules:
-                in_group = True
-                break
-
-        if not in_group and script_fragments['module'] not in enabled_modules:
-            continue
-
-        relative_path = re.search("resources.*", path)[0]
-
-        if relative_path.replace("\\", "") not in existing_files:
-            try:
-                commands = ""
-                fd = open(path, encoding="utf8")
-                for line in fd.readlines():
-                    if not re.search("--.*$", line.strip()):
-                        commands = commands + line.replace("\n", " ").replace("\t", " ")
-                # commands = fd.read()
-                fd.close()
-            except:
-                pass
-
-            create_command_list[relative_path] = []
-            alter_command_list[relative_path] = []
-            other_command_list[relative_path] = []
-
-            for command in commands.split(';'):
-                command = command.strip().replace("\n", " ").replace("\t", " ")
-
-                if command and "use " not in command.lower() and "create database " not in command.lower() and "alter database " not in command.lower():
-                    if "create table " in command.lower():
-                        create_command_list[relative_path].append(command)
-                    elif "alter table " in command.lower():
-                        alter_command_list[relative_path].append(command)
-                    else:
-                        other_command_list[relative_path].append(command)
-
-            if len(create_command_list[relative_path]) == 0:
-                del(create_command_list[relative_path])
-            if len(alter_command_list[relative_path]) == 0:
-                del(alter_command_list[relative_path])
-            if len(other_command_list[relative_path]) == 0:
-                del(other_command_list[relative_path])
+            # TODO: Add alter database
+            create_queries = create_queries + script['queries']['create']
+            alter_queries = alter_queries + script['queries']['alter']
+            insert_queries = insert_queries + script['queries']['insert']
 
     try:
-        db_cursor.execute(use_db_command)
+        error_messages = ""
+        error_messages += execute_sql_queries(create_queries, db_cursor)
+        error_messages += execute_sql_queries(alter_queries, db_cursor)
+        error_messages += execute_sql_queries(insert_queries, db_cursor)
 
-        for file in create_command_list:
-            print("Creating tables from file {0}".format(file))
-            for command in create_command_list[file]:
-                try:
-                    db_cursor.execute(command)
+        if error_messages != "":
+            print("\n\033[1;31mSome queries have not been executed correctly. We've created a file with all the problematic queies [sql_error_query.log].\nPlease review it to make sure everythig works as expected.\nIf a query didn't run and should have been, please make the correction and execute it manually\033[0;37m")
 
-                except Exception as e:
-                    if e.errno == 1050:
-                        print(
-                            "\033[1;33mWARNING:\033[0;37m \"{0}\" when executing \"{1}...\" in file \"{2}\" - We continue the process".format(
-                                e.msg, command[0:30], file))
+            if os.path.exists("sql_error_query.log"):
+                os.remove("sql_error_query.log")
 
-        for file in alter_command_list:
-            print("Alter table from file {0}".format(file))
-            try:
-                for command in alter_command_list[file]:
-                    db_cursor.execute(command)
+            f = open("sql_error_query.log", "a", encoding="utf-8")
+            f.write(error_messages)
+            f.close()
 
-                db_cursor.execute("INSERT IGNORE INTO ku_sql_files VALUES ('{0}')".format(file))
-            except Exception as e:
-                if e.errno == 1060:
-                    print(
-                        "\033[1;33mWARNING:\033[0;37m \"{0}\" when executing \"{1}...\" in file \"{2}\" - We continue the process".format(
-                            e.msg, command[0:30], file))
-                else:
-                    print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
-                    raise Exception()
-
-        for file in other_command_list:
-            print("Inserting data from file {0}".format(file))
-            try:
-                for command in other_command_list[file]:
-                    db_cursor.execute(command)
-
-                db_cursor.execute("INSERT IGNORE INTO ku_sql_files VALUES ('{0}')".format(file))
-            except Exception as e:
-                if e.errno == 1062:
-                    print(
-                        "\033[1;33mWARNING:\033[0;37m \"{0}\" when executing \"{1}...\" in file \"{2}\" - We continue the process".format(
-                            e.msg, command[0:30], file))
-                else:
-                    print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
-                    raise Exception()
-
-        db_connection.commit()
     except Exception as e:
-        print(
-            "\033[1;31m\nWe rollback and stop the execution. Make sure you have all the resources dependencies.\033[0;37m")
         db_connection.rollback()
+
+    db_connection.commit()
 
 
 if not exists("./server"):
