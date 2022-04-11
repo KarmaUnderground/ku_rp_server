@@ -181,8 +181,13 @@ def execute_sql_scripts():
 
                 db_cursor.execute("INSERT IGNORE INTO ku_sql_files VALUES ('{0}')".format(file))
             except Exception as e:
-                print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
-                raise Exception()
+                if e.errno == 1060:
+                    print(
+                        "\033[1;33mWARNING:\033[0;37m \"{0}\" when executing \"{1}...\" in file \"{2}\" - We continue the process".format(
+                            e.msg, command[0:30], file))
+                else:
+                    print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
+                    raise Exception()
 
         for file in other_command_list:
             print("Inserting data from file {0}".format(file))
@@ -192,15 +197,19 @@ def execute_sql_scripts():
 
                 db_cursor.execute("INSERT IGNORE INTO ku_sql_files VALUES ('{0}')".format(file))
             except Exception as e:
-                print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
-                raise Exception()
+                if e.errno == 1062:
+                    print(
+                        "\033[1;33mWARNING:\033[0;37m \"{0}\" when executing \"{1}...\" in file \"{2}\" - We continue the process".format(
+                            e.msg, command[0:30], file))
+                else:
+                    print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
+                    raise Exception()
 
         db_connection.commit()
     except Exception as e:
         print(
             "\033[1;31m\nWe rollback and stop the execution. Make sure you have all the resources dependencies.\033[0;37m")
         db_connection.rollback()
-        exit(0)
 
 
 if not exists("./server"):
@@ -234,4 +243,4 @@ execute_sql_scripts()
 print('Start Server')
 subprocess.Popen(r"./server/FXServer.exe +exec ../server.cfg", cwd=r"./server-data")
 
-# input("Completed [ENTER] to exit")
+input("Completed [ENTER] to exit")
