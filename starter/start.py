@@ -17,35 +17,58 @@ from git import Repo
 from pathlib import Path
 from os.path import exists
 
+config_file = "./server.cfg"
+
+
+def get_enabled_modules():
+    file_read = open("./server.cfg", "r")
+    modules = re.findall("\n\s*ensure\s([^\s]*)", file_read.read())
+    file_read.close()
+
+    return modules
+
+
+def get_script_fragments(path):
+    elements = path.split("\\")
+
+    name = elements.pop()
+    module = ""
+    groups = []
+
+    elements = elements[2:]
+
+    for element in elements:
+        if bool(re.search("\[.*\]", element)):
+            groups.append(element)
+        else:
+            module = element
+            break
+
+    return {
+        'name': name,
+        'module': module,
+        "groups": groups
+    }
+
 
 def get_db_connection_variables(config_file):
-    if not exists(config_file):
-        config_file = input(
-            "The file \"{0}\" does not exist. Please provide the path of the config file: ".format(config_file))
+    file_read = open(config_file, "r")
+    content = file_read.read()
+    file_read.close()
+    connection_string = re.search("mysql:\/\/(.*):(.*)@(.*)\/(.*)\?", content)
 
-        return get_db_connection_variables(config_file)
-    else:
-        file_read = open(config_file, "r")
-
-        connection_string = ""
-
-        for line in file_read.readlines():
-            if "mysql_connection_string" in line:
-                connection_string = re.search(".*\ \"(.*)\"", line).group(1)
-                break
-
-        file_read.close()
-
-        variable_strings = connection_string.split(";")
-        variable_dict = dict(s.split('=') for s in variable_strings)
-
-        return variable_dict
+    return {
+        'user': connection_string.group(1),
+        'password': connection_string.group(2),
+        'host': connection_string.group(3),
+        'database': connection_string.group(4)
+    }
 
 
 def get_db(connection_variables):
     db_connection = mysql.connector.connect(
-        host=connection_variables['server'],
-        user=connection_variables['userid'],
+        host=connection_variables['host'],
+        user=connection_variables['user'],
         password=connection_variables['password'],
         database=connection_variables['database']
     )
@@ -57,10 +80,12 @@ def get_db(connection_variables):
 def execute_sql_scripts():
     db_connection = None
 
+    enabled_modules = get_enabled_modules()
+
     print("Waiting for database")
     while not db_connection:
         try:
-            db_configs = get_db_connection_variables("./cfx-server-data/server.cfg")
+            db_configs = get_db_connection_variables("./server.cfg")
             db_connection, db_cursor = get_db(db_configs)
         except Exception as e:
             time.sleep(1)
@@ -76,46 +101,88 @@ def execute_sql_scripts():
 
     sql_scripts_paths = []
 
-    path_list = Path("./cfx-server-data/resources").glob('**/*.sql')
+    path_list = Path("./server-data/resources").glob('**/*.sql')
     for path in path_list:
         sql_scripts_paths.append(str(path))
 
     use_db_command = "USE {0}; ".format(db_configs['database'])
-    table_command_list = {}
+    create_command_list = {}
+    alter_command_list = {}
     other_command_list = {}
 
     for path in sql_scripts_paths:
+        script_fragments = get_script_fragments(path)
+
+        in_group = False
+        for fragment in script_fragments['groups']:
+            if fragment in enabled_modules:
+                in_group = True
+                break
+
+        if not in_group and script_fragments['module'] not in enabled_modules:
+            continue
+
         relative_path = re.search("resources.*", path)[0]
 
         if relative_path.replace("\\", "") not in existing_files:
-            fd = open(path, 'r')
-            commands = fd.read()
-            fd.close()
+            try:
+                commands = ""
+                fd = open(path, encoding="utf8")
+                for line in fd.readlines():
+                    if not re.search("--.*$", line.strip()):
+                        commands = commands + line.replace("\n", " ").replace("\t", " ")
+                # commands = fd.read()
+                fd.close()
+            except:
+                pass
 
-            table_command_list[relative_path] = []
+            create_command_list[relative_path] = []
+            alter_command_list[relative_path] = []
             other_command_list[relative_path] = []
 
             for command in commands.split(';'):
                 command = command.strip().replace("\n", " ").replace("\t", " ")
-                if command and "use " not in command.lower() and "create database " not in command.lower():
+
+                if command and "use " not in command.lower() and "create database " not in command.lower() and "alter database " not in command.lower():
                     if "create table " in command.lower():
-                        table_command_list[relative_path].append(command)
+                        create_command_list[relative_path].append(command)
+                    elif "alter table " in command.lower():
+                        alter_command_list[relative_path].append(command)
                     else:
                         other_command_list[relative_path].append(command)
+
+            if len(create_command_list[relative_path]) == 0:
+                del(create_command_list[relative_path])
+            if len(alter_command_list[relative_path]) == 0:
+                del(alter_command_list[relative_path])
+            if len(other_command_list[relative_path]) == 0:
+                del(other_command_list[relative_path])
 
     try:
         db_cursor.execute(use_db_command)
 
-        for file in table_command_list:
+        for file in create_command_list:
             print("Creating tables from file {0}".format(file))
-            for command in table_command_list[file]:
+            for command in create_command_list[file]:
                 try:
                     db_cursor.execute(command)
+
                 except Exception as e:
                     if e.errno == 1050:
                         print(
                             "\033[1;33mWARNING:\033[0;37m \"{0}\" when executing \"{1}...\" in file \"{2}\" - We continue the process".format(
                                 e.msg, command[0:30], file))
+
+        for file in alter_command_list:
+            print("Alter table from file {0}".format(file))
+            try:
+                for command in alter_command_list[file]:
+                    db_cursor.execute(command)
+
+                db_cursor.execute("INSERT IGNORE INTO ku_sql_files VALUES ('{0}')".format(file))
+            except Exception as e:
+                print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
+                raise Exception()
 
         for file in other_command_list:
             print("Inserting data from file {0}".format(file))
@@ -123,7 +190,7 @@ def execute_sql_scripts():
                 for command in other_command_list[file]:
                     db_cursor.execute(command)
 
-                db_cursor.execute("INSERT INTO ku_sql_files VALUES ('{0}')".format(file))
+                db_cursor.execute("INSERT IGNORE INTO ku_sql_files VALUES ('{0}')".format(file))
             except Exception as e:
                 print("\033[1;31mERROR:\033[0;37m\"{0}\" when executing \"{1}...\" it the file \"{2}\"".format(e.msg, command[0:30],file))
                 raise Exception()
@@ -133,6 +200,7 @@ def execute_sql_scripts():
         print(
             "\033[1;31m\nWe rollback and stop the execution. Make sure you have all the resources dependencies.\033[0;37m")
         db_connection.rollback()
+        exit(0)
 
 
 if not exists("./server"):
@@ -148,11 +216,12 @@ if not exists("./server"):
 
     os.remove("./server.7z")
 
+print("Refresh modules")
 repo = Repo("./")
 for submodule in repo.submodules:
-    submodule.update(init=True)
+    submodule.update(init=True, recursive=True)
 
-repo = Repo("./cfx-server-data")
+repo = Repo("./server-data")
 for submodule in repo.submodules:
     submodule.update(init=True)
 
@@ -163,8 +232,6 @@ print('Executing SQL scripts')
 execute_sql_scripts()
 
 print('Start Server')
-subprocess.Popen(r"./server/FXServer.exe +exec server.cfg", cwd=r"./cfx-server-data")
+subprocess.Popen(r"./server/FXServer.exe +exec ../server.cfg", cwd=r"./server-data")
 
-input("Completed [ENTER] to exit")
-
-exit(0)
+# input("Completed [ENTER] to exit")
