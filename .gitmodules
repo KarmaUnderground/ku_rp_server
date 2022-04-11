@@ -1,0 +1,4 @@
+[submodule "server-data"]
+	path = server-data
+	url = https://github.com/KarmaUnderground/cfx-server-data.git
+	branch = master
